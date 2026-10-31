@@ -1,0 +1,52 @@
+<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>mginx-gpu-bench — WebGPU vs WASM</title>
+<style>body{font-family:system-ui,sans-serif;max-width:900px;margin:2em auto;padding:0 1em;background:#111;color:#eee}
+select,input,button{font-size:1em;padding:.3em;margin:.2em}table{border-collapse:collapse;width:100%;margin-top:1em}
+td,th{border:1px solid #444;padding:.4em;text-align:right}th{background:#222}.ok{color:#6f6}.bad{color:#f66}pre{background:#222;padding:.5em;overflow:auto}</style></head><body>
+<h1>WebGPU vs WASM — микробенчмарк</h1>
+<p id="gpu">Проверка WebGPU…</p>
+<div>Нагрузка: <select id="wl"><option value="plinko">Plinko MC (N шаров × R рядов)</option><option value="colfold">Column-product fold (N колонок × K строк)</option></select>
+N: <select id="n"><option>65536</option><option>262144</option><option selected>1048576</option><option>4194304</option><option>16777216</option></select>
+R/K: <input id="k" type="number" value="16" min="1" max="255" style="width:5em">
+seed: <input id="seed" type="number" value="12345" style="width:7em">
+повторы: <input id="reps" type="number" value="5" min="1" max="50" style="width:4em">
+<button id="run">Запустить</button></div>
+<table><thead><tr><th style="text-align:left">Backend</th><th>median ms</th><th>min ms</th><th>Mops/s (N·K/ms)</th><th>× vs WASM</th><th>checksum</th></tr></thead><tbody id="out"></tbody></table>
+<p id="verdict"></p><pre id="log"></pre>
+<p style="color:#888;font-size:.9em">Одинаковый PCG-hash (u32) во всех бэкендах → результаты детерминированы и должны совпадать бит-в-бит. Время WebGPU — end-to-end (запись буфера, dispatch, readback), после прогрева пайплайна. WASM — однопоточный (Rust no_std, wasm32). JS — тот же алгоритм на чистом JS.</p>
+<script type="module">
+const $=id=>document.getElementById(id), log=s=>$('log').textContent+=s+'\n';
+const pcg=v=>{let s=(Math.imul(v,747796405)+2891336453)>>>0;let w=Math.imul(((s>>>((s>>>28)+4))^s)>>>0,277803737)>>>0;return ((w>>>22)^w)>>>0};
+const js={plinko(n,r,seed){const b=new Uint32Array(256);for(let i=0;i<n;i++){let st=pcg((i^seed)>>>0),p=0;for(let j=0;j<r;j++){st=pcg(st);p+=st&1}b[p&255]++}return b},
+colfold(n,k,seed){let a=0;for(let c=0;c<n;c++){let st=pcg((c^seed)>>>0),pr=1;for(let j=0;j<k;j++){st=pcg(st);pr=Math.imul(pr,st|1)>>>0}a=(a+pr)>>>0}return a}};
+const {instance}=await WebAssembly.instantiateStreaming(fetch('bench.wasm'));const W=instance.exports;
+const wasm={plinko(n,r,s){W.plinko(n,r,s);return new Uint32Array(W.memory.buffer,W.bins_ptr(),256).slice()},colfold:(n,k,s)=>W.colfold(n,k,s)>>>0};
+const WGSL=`fn pcg(v:u32)->u32{let s=v*747796405u+2891336453u;let w=((s>>((s>>28u)+4u))^s)*277803737u;return (w>>22u)^w;}
+struct P{n:u32,k:u32,seed:u32,mode:u32}; @group(0)@binding(0) var<uniform> p:P; @group(0)@binding(1) var<storage,read_write> o:array<atomic<u32>,257>;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) g:vec3<u32>,@builtin(num_workgroups) nw:vec3<u32>){
+let i=g.x+g.y*nw.x*256u; if(i>=p.n){return;} var st=pcg(i^p.seed);
+if(p.mode==0u){var pos=0u;for(var j=0u;j<p.k;j++){st=pcg(st);pos+=st&1u;} atomicAdd(&o[pos&255u],1u);}
+else{var pr=1u;for(var j=0u;j<p.k;j++){st=pcg(st);pr=pr*(st|1u);} atomicAdd(&o[256],pr);}}`;
+let gpu=null;
+async function initGPU(){if(!navigator.gpu)throw'navigator.gpu отсутствует';const ad=await navigator.gpu.requestAdapter({powerPreference:'high-performance'});if(!ad)throw'адаптер не найден';
+const dev=await ad.requestDevice();const pl=dev.createComputePipeline({layout:'auto',compute:{module:dev.createShaderModule({code:WGSL}),entryPoint:'main'}});
+const u=dev.createBuffer({size:16,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST}),o=dev.createBuffer({size:257*4,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC|GPUBufferUsage.COPY_DST}),
+rb=dev.createBuffer({size:257*4,usage:GPUBufferUsage.MAP_READ|GPUBufferUsage.COPY_DST});
+const bg=dev.createBindGroup({layout:pl.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:u}},{binding:1,resource:{buffer:o}}]});
+const info=ad.info||{};gpu={dev,pl,u,o,rb,bg,name:[info.vendor,info.architecture,info.description].filter(Boolean).join(' ')||'unknown'}}
+async function runGPU(mode,n,k,s){const {dev,pl,u,o,rb,bg}=gpu;dev.queue.writeBuffer(u,0,new Uint32Array([n,k,s>>>0,mode]));dev.queue.writeBuffer(o,0,new Uint32Array(257));
+const wg=Math.ceil(n/256),x=Math.min(wg,65535),y=Math.ceil(wg/x);const e=dev.createCommandEncoder(),c=e.beginComputePass();c.setPipeline(pl);c.setBindGroup(0,bg);c.dispatchWorkgroups(x,y);c.end();
+e.copyBufferToBuffer(o,0,rb,0,257*4);dev.queue.submit([e.finish()]);await rb.mapAsync(GPUMapMode.READ);const r=new Uint32Array(rb.getMappedRange()).slice();rb.unmap();return mode?r[256]:r.slice(0,256)}
+try{await initGPU();$('gpu').innerHTML=`<span class=ok>WebGPU доступен</span>: ${gpu.name}`}catch(e){$('gpu').innerHTML=`<span class=bad>WebGPU недоступен (${e}).</span> Запускаются только WASM и JS. Попробуйте Chrome/Edge 113+ (или включите WebGPU во флагах браузера).`}
+const sum=v=>typeof v==='number'?v:v.reduce((a,x,i)=>(a+Math.imul(x,i+1))>>>0,0);
+const med=a=>{const b=[...a].sort((x,y)=>x-y);return b[b.length>>1]};
+async function bench(name,f,reps){await f();const t=[];let r;for(let i=0;i<reps;i++){const t0=performance.now();r=await f();t.push(performance.now()-t0);await new Promise(q=>setTimeout(q,0))}return{name,med:med(t),min:Math.min(...t),ck:sum(r)}}
+$('run').onclick=async()=>{const wl=$('wl').value,n=+$('n').value,k=+$('k').value,s=+$('seed').value,reps=+$('reps').value,mode=wl==='plinko'?0:1;
+$('run').disabled=true;$('out').innerHTML='';$('log').textContent='';$('verdict').textContent='Выполняется…';await new Promise(q=>setTimeout(q,30));
+const rs=[];rs.push(await bench('WASM (Rust, 1 поток)',()=>wasm[wl](n,k,s),reps));
+if(n*k<=1<<26)rs.push(await bench('JS (чистый)',()=>js[wl](n,k,s),Math.min(reps,3)));else log('JS пропущен (слишком большой N·K)');
+if(gpu)try{rs.push(await bench('WebGPU compute',()=>runGPU(mode,n,k,s),reps))}catch(e){log('GPU ошибка: '+e)}
+const base=rs[0].med;for(const r of rs)$('out').innerHTML+=`<tr><td style="text-align:left">${r.name}</td><td>${r.med.toFixed(2)}</td><td>${r.min.toFixed(2)}</td><td>${(n*k/r.med/1e3).toFixed(1)}</td><td>${(base/r.med).toFixed(2)}×</td><td>${r.ck.toString(16)}</td></tr>`;
+const ok=rs.every(r=>r.ck===rs[0].ck);$('verdict').innerHTML=(ok?'<span class=ok>Checksums совпадают ✓</span>':'<span class=bad>Checksums НЕ совпадают ✗</span>')+` — ${wl}, N=${n}, K=${k}, seed=${s}`;
+log(JSON.stringify({wl,n,k,seed:s,reps,ua:navigator.userAgent,gpu:gpu?.name,results:rs}));$('run').disabled=false};
+</script></body></html>
