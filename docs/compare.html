@@ -1,0 +1,35 @@
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>mginx: TS vs Rust/WASM in the browser</title>
+<style>body{font:14px system-ui;margin:12px}table{border-collapse:collapse}td,th{border:1px solid #ccc;padding:4px 8px;text-align:right}td:first-child,th:first-child{text-align:left}.np{color:#999}button{margin:2px}small{color:#666}</style></head><body>
+<h2>Расчёт демо в браузере: TypeScript vs Rust→WASM</h2>
+<p>Всё считается локально. Время = <code>performance.now()</code>: прогрев + медиана 5 прогонов, длинные расчёты — один полный прогон.
+WASM по умолчанию многопоточный там, где расчёт делится на независимые части (<span id="spl"></span>): <b id="nwl"></b> Web Worker'ов, у каждого свой экземпляр WASM, очередь по стопам барабана 1. Остальные демо — один поток (считаются за миллисекунды). TS в браузере — один поток.</p>
+<p>Workers: <input id="nw" type="number" min="1" style="width:4em"> <label><input id="st1" type="checkbox"> WASM в 1 поток (для сравнения)</label></p>
+<button id="all">Run all (TS + WASM)</button> <button id="allw">Run all WASM only</button> <span id="st"></span>
+<div style="overflow-x:auto"><table id="t"><thead><tr><th>Demo</th><th>TS ms</th><th>TS RTP</th><th>WASM ms</th><th>WASM RTP</th><th></th></tr></thead><tbody></tbody></table></div>
+<script type="module">
+const w=new Worker("./dist/worker.js",{type:"module"});const tb=document.querySelector("#t tbody");let list=[],splittable=[];const pend=new Map();window.__results={ts:{},wasm:{}};
+const nw=document.querySelector("#nw");nw.value=navigator.hardwareConcurrency||4;const upd=()=>document.querySelector("#nwl").textContent=nw.value;nw.oninput=upd;upd();
+const fmt=r=>!r?"":r.error?"ERR":r.notPorted?'<span class="np">not ported</span>':r.ms.toFixed(r.ms<10?3:1)+(r.workers>1?` <small>×${r.workers}</small>`:"");
+const rtp=r=>r&&r.rtp!=null?(100*r.rtp).toFixed(4)+"%":"";
+const call=(id,engine)=>new Promise(res=>{pend.set(id+engine,res);w.postMessage({id,engine});});
+const specOf=id=>new Promise(res=>{pend.set("spec"+id,res);w.postMessage({specOf:id});});
+w.onmessage=e=>{if(e.data.specOf){pend.get("spec"+e.data.specOf)?.(e.data);return;}
+  if(e.data.demos){list=e.data.demos;splittable=e.data.splittable;document.querySelector("#spl").textContent=splittable.join(", ");for(const d of list){const tr=document.createElement("tr");tr.id="r_"+d.id;tr.innerHTML=`<td title="${d.id}">${d.title}</td><td></td><td></td><td></td><td></td><td><button>TS</button><button>WASM</button></td>`;tb.append(tr);
+  const [a,b]=tr.querySelectorAll("button");a.onclick=()=>run(d.id,"ts");b.onclick=()=>run(d.id,"wasm");}window.__ready=true;return;}
+  const {id,engine,r}=e.data;pend.get(id+engine)?.(r);};
+// Multithreaded WASM: pool of N module workers, dynamic queue of reel-1 stops; partial EVs sum to the exact EV.
+async function runMT(id,N){const {spec,n0}=await specOf(id);const sp=JSON.parse(spec);
+  const ws=await Promise.all(Array.from({length:N},()=>new Promise((r,j)=>{const x=new Worker("./dist/range-worker.js",{type:"module"});x.onerror=j;x.onmessage=()=>r(x);x.postMessage({spec});})));
+  const t0=performance.now();let next=0,ev=0;
+  await Promise.all(ws.map(x=>new Promise(res=>{const go=()=>{if(next>=n0)return res();x.postMessage({i:next++});};x.onmessage=e=>{ev+=e.data.v;go();};go();})));
+  const ms=performance.now()-t0;ws.forEach(x=>x.terminate());return {ms,ev,rtp:ev/sp.bet,workers:N,mode:"single",method:"split by reel-1 stop: N Web Workers x own WASM instance",exact:true};}
+async function run(id,engine,single=document.querySelector("#st1").checked){document.querySelector("#st").textContent=`running ${engine} ${id}…`;let r,key=id;
+  if(engine==="wasm"&&splittable.includes(id)&&!single&&+nw.value>1){try{r=await runMT(id,+nw.value);}catch(err){console.warn("MT failed, falling back to 1 thread",err);}}
+  else if(engine==="wasm"&&splittable.includes(id)&&single)key=id+"@1thread";
+  if(!r)r=await call(id,engine);window.__results[engine][key]=r;
+  if(key===id){const tds=document.querySelectorAll(`#r_${id} td`);const o=engine==="ts"?1:3;tds[o].innerHTML=fmt(r);tds[o+1].textContent=rtp(r);}
+  document.querySelector("#st").textContent="";return r;}
+async function runAll(engines){for(const d of list)for(const en of engines)await run(d.id,en);window.__done=true;document.querySelector("#st").textContent="done";}
+async function runSingleSplittable(){for(const id of splittable)await run(id,"wasm",true);}
+document.querySelector("#all").onclick=()=>runAll(["wasm","ts"]);document.querySelector("#allw").onclick=()=>runAll(["wasm"]);Object.assign(window,{runAll,runSingleSplittable});
+</script></body></html>
